@@ -386,14 +386,15 @@ mod isr {
 /// The tick-rate is 1MHz (i.e. 1 tick is 1us).
 #[cfg(feature = "embassy-time-driver")]
 pub mod embassy_time_driver {
-    use core::cell::RefCell;
     use core::task::Waker;
     use std::sync::OnceLock;
 
     use ::embassy_time_driver::Driver;
     use embassy_time_queue_utils::Queue;
 
-    use crate::private::mutex::Mutex;
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    use embassy_sync::blocking_mutex::Mutex as CsMutex;
+
     use crate::timer::*;
 
     static TIMER_SERVICE: OnceLock<EspTaskTimerService> = OnceLock::new();
@@ -461,16 +462,16 @@ pub mod embassy_time_driver {
     }
 
     struct EspDriver {
-        inner: Mutex<RefCell<EspDriverInner>>,
+        inner: CsMutex<CriticalSectionRawMutex, EspDriverInner>,
     }
 
     impl EspDriver {
         const fn new() -> Self {
             Self {
-                inner: Mutex::new(RefCell::new(EspDriverInner {
+                inner: CsMutex::new(EspDriverInner {
                     queue: Queue::new(),
                     timer: None,
-                })),
+                }),
             }
         }
     }
@@ -487,29 +488,37 @@ pub mod embassy_time_driver {
         fn schedule_wake(&self, at: u64, waker: &Waker) {
             let service = TIMER_SERVICE.get_or_init(|| EspTaskTimerService::new().unwrap());
 
-            let guard = self.inner.lock();
-            let mut inner = guard.borrow_mut();
+            // SAFETY: `lock_mut` is unsafe because calling it *re-entrantly* on the same
+            // mutex would create simultaneous &mut references to the same data, which
+            // violates Rust’s aliasing rules. In this driver we never call `lock_mut`
+            // re-entrantly: `schedule_wake()` runs in the executor task, while the
+            // timer callback runs in the esp_timer task, and these contexts never invoke
+            // `lock_mut` while another `lock_mut` closure is active on the same thread.
+            // The raw mutex (CriticalSectionRawMutex) provides mutual exclusion across
+            // tasks, ensuring only one mutable borrow exists at a time. Therefore, this
+            // call cannot create overlapping &mut borrows and is sound.
+            unsafe {
+                self.inner.lock_mut(|inner| {
+                    if inner.timer.is_none() {
+                        // Driver is always statically allocated, so this is safe
+                        let static_self: &'static Self = core::mem::transmute(self);
 
-            if inner.timer.is_none() {
-                // Driver is always statically allocated, so this is safe
-                let static_self: &'static Self = unsafe { core::mem::transmute(self) };
+                        inner.timer = Some(
+                            service
+                                .timer(move || {
+                                    static_self.inner.lock_mut(|inner| {
+                                        inner.schedule_next_expiration();
+                                    });
+                                })
+                                .unwrap(),
+                        );
+                    }
 
-                inner.timer = Some(
-                    service
-                        .timer(move || {
-                            static_self
-                                .inner
-                                .lock()
-                                .borrow_mut()
-                                .schedule_next_expiration()
-                        })
-                        .unwrap(),
-                );
-            }
-
-            if inner.queue.schedule_wake(at, waker) {
-                inner.schedule_next_expiration();
-            }
+                    if inner.queue.schedule_wake(at, waker) {
+                        inner.schedule_next_expiration();
+                    }
+                })
+            };
         }
     }
 
