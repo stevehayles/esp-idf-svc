@@ -388,6 +388,7 @@ mod isr {
 pub mod embassy_time_driver {
     use core::cell::RefCell;
     use core::task::Waker;
+    use std::sync::OnceLock;
 
     use ::embassy_time_driver::Driver;
     use embassy_time_queue_utils::Queue;
@@ -395,12 +396,16 @@ pub mod embassy_time_driver {
     use crate::private::mutex::Mutex;
     use crate::timer::*;
 
+    static TIMER_SERVICE: OnceLock<EspTaskTimerService> = OnceLock::new();
+
     struct EspDriverInner {
         queue: embassy_time_queue_utils::Queue,
         timer: Option<EspTimer<'static>>,
     }
 
     impl EspDriverInner {
+        /// Current time in microseconds as a 64-bit monotonic counter.
+        #[inline(always)]
         fn now() -> u64 {
             unsafe { esp_timer_get_time() as _ }
         }
@@ -409,11 +414,20 @@ pub mod embassy_time_driver {
             /// End of epoch minus one day
             const MAX_SAFE_TIMEOUT_US: u64 = u64::MAX - 24 * 60 * 60 * 1000 * 1000;
 
-            let timer = self.timer.as_mut().unwrap();
+            let timer = self
+                .timer
+                .as_mut()
+                .expect("timer must be created before scheduling");
 
             loop {
                 let now = Self::now();
                 let next_at = self.queue.next_expiration(now);
+
+                // `next_at == u64::MAX` means "no timers" in the integrated queue.
+                if next_at == u64::MAX {
+                    // Leave the timer disarmed; nothing to do.
+                    break;
+                }
 
                 if now < next_at {
                     let after = next_at - now;
@@ -465,12 +479,13 @@ pub mod embassy_time_driver {
     unsafe impl Sync for EspDriver {}
 
     impl Driver for EspDriver {
+        #[inline(always)]
         fn now(&self) -> u64 {
             EspDriverInner::now()
         }
 
         fn schedule_wake(&self, at: u64, waker: &Waker) {
-            let service = EspTimerService::<Task>::new().unwrap();
+            let service = TIMER_SERVICE.get_or_init(|| EspTaskTimerService::new().unwrap());
 
             let guard = self.inner.lock();
             let mut inner = guard.borrow_mut();
