@@ -378,6 +378,224 @@ mod isr {
     }
 }
 
+#[cfg(feature = "embassy-time-driver")]
+mod timer_wheel {
+    use core::cmp::{min, Ordering};
+    use core::task::Waker;
+
+    use heapless::Vec;
+
+    #[derive(Debug)]
+    struct Timer {
+        /// Absolute deadline in microseconds.
+        deadline: u64,
+        waker: Waker,
+    }
+
+    impl PartialEq for Timer {
+        fn eq(&self, other: &Self) -> bool {
+            self.deadline == other.deadline && self.waker.will_wake(&other.waker)
+        }
+    }
+    impl Eq for Timer {}
+
+    impl PartialOrd for Timer {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            self.deadline.partial_cmp(&other.deadline)
+        }
+    }
+    impl Ord for Timer {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.deadline.cmp(&other.deadline)
+        }
+    }
+
+    /// Single-level timer wheel.
+    ///
+    /// - `BUCKETS`: number of buckets in the wheel
+    /// - `PER_BUCKET`: max timers per bucket
+    /// - `RES_US`: resolution per bucket in microseconds
+    #[derive(Debug)]
+    pub struct TimerWheel<const BUCKETS: usize, const PER_BUCKET: usize, const RES_US: u64> {
+        /// Buckets of timers; each bucket holds timers whose deadline falls into
+        /// some `[k*RES_US, (k+1)*RES_US)` window modulo `BUCKETS * RES_US`.
+        buckets: [Vec<Timer, PER_BUCKET>; BUCKETS],
+
+        /// Current "tick" (time / RES_US) we've advanced to.
+        current_tick: u64,
+        initialized: bool,
+    }
+
+    impl<const BUCKETS: usize, const PER_BUCKET: usize, const RES_US: u64>
+        TimerWheel<BUCKETS, PER_BUCKET, RES_US>
+    {
+        /// Create a new wheel, with an initial "now" in microseconds.
+        /// This lets us align `current_tick` to the real time base.
+        pub fn new() -> Self {
+            // Runtime assertion: BUCKETS should be power of 2 for optimal modulo
+            // TODO: Const can't be used from an outer type so not sure how to check at compile time...
+            assert!(BUCKETS.is_power_of_two(), "BUCKETS must be a power of 2");
+
+            Self {
+                buckets: core::array::from_fn(|_| Vec::new()),
+                current_tick: 0,
+                initialized: false,
+            }
+        }
+
+        /// Compute bucket index for an absolute deadline.
+        /// Uses bitwise AND for modulo when BUCKETS is power of 2.
+        #[inline]
+        fn bucket_index(deadline: u64) -> usize {
+            // Integer division truncates: each bucket covers RES_US microseconds.
+            let tick = deadline / RES_US;
+            // Fast modulo for power-of-2 BUCKETS
+            (tick as usize) & (BUCKETS - 1)
+        }
+
+        /// Internal helper: ensure the wheel is initialized with a real timestamp.
+        #[inline]
+        fn ensure_init(&mut self, now_us: u64) {
+            if !self.initialized {
+                self.current_tick = now_us / RES_US;
+                self.initialized = true;
+            }
+        }
+
+        /// Schedules a task to run at `at` (absolute µs timestamp).
+        ///
+        /// Returns `true` if the *earliest deadline in the wheel* might have changed,
+        /// in which case the caller should reprogram the underlying hardware timer.
+        pub fn schedule_wake(&mut self, at: u64, waker: &Waker) -> bool {
+            // lazy init
+            self.ensure_init(at);
+
+            // Fast path: see if this waker already has a timer; if so, update deadline.
+            // We search all buckets; if you want, you can keep a side map<waker, bucket>
+            // later for O(1) lookup, but this keeps things simple and small.
+            let mut found = None;
+
+            'outer: for (b_idx, bucket) in self.buckets.iter_mut().enumerate() {
+                for (t_idx, timer) in bucket.iter_mut().enumerate() {
+                    if timer.waker.will_wake(waker) {
+                        found = Some((b_idx, t_idx));
+                        // Update deadline; we may want to move to another bucket.
+                        timer.deadline = at;
+                        break 'outer;
+                    }
+                }
+            }
+
+            if let Some((old_bucket_idx, timer_idx)) = found {
+                let new_bucket_idx = Self::bucket_index(at);
+
+                // If the bucket index changed, move the timer into the proper bucket.
+                if new_bucket_idx != old_bucket_idx {
+                    let mut timer = self.buckets[old_bucket_idx].swap_remove(timer_idx);
+                    timer.deadline = at;
+
+                    // Try to insert into the new bucket.
+                    self.insert_into_bucket(new_bucket_idx, timer);
+                }
+
+                // Conservative: earliest deadline might have changed.
+                // For small BUCKETS this is cheap enough.
+                return true;
+            }
+
+            // Not found: create a new timer.
+            let timer = Timer {
+                deadline: at,
+                waker: waker.clone(),
+            };
+
+            let bucket_idx = Self::bucket_index(at);
+            self.insert_into_bucket(bucket_idx, timer)
+        }
+
+        /// Helper: insert into a bucket, evicting the *latest* timer in that bucket if needed.
+        ///
+        /// Returns `true` if earliest deadline in the wheel might have changed.
+        #[inline]
+        fn insert_into_bucket(&mut self, bucket_idx: usize, mut timer: Timer) -> bool {
+            let bucket = &mut self.buckets[bucket_idx];
+
+            if bucket.len() < PER_BUCKET {
+                // Space available; just push.
+                // We *could* keep bucket sorted by deadline, but it's not necessary:
+                // we always check `deadline <= now` before firing.
+                bucket.push(timer).ok().unwrap();
+                return true;
+            }
+
+            // Bucket full: evict the timer with the *latest* deadline in that bucket.
+            // This is much fairer than "pop arbitrary last" like the old queue.
+            let mut worst_idx = 0;
+            let mut worst_deadline = bucket[0].deadline;
+
+            for (i, t) in bucket.iter().enumerate().skip(1) {
+                if t.deadline > worst_deadline {
+                    worst_deadline = t.deadline;
+                    worst_idx = i;
+                }
+            }
+
+            // If the new timer is later than the worst, just wake it immediately
+            // (it's "least urgent"), and keep the existing timers.
+            if timer.deadline >= worst_deadline {
+                timer.waker.wake_by_ref();
+                return false;
+            }
+
+            // Otherwise, evict the worst, wake that one early, and insert the new one.
+            let evicted = bucket.swap_remove(worst_idx);
+            evicted.waker.wake_by_ref();
+
+            bucket.push(timer).ok().unwrap();
+
+            true
+        }
+
+        /// Dequeues expired timers and returns the next alarm time as an absolute µs timestamp.
+        ///
+        /// If there are no timers left, returns `u64::MAX`.
+        pub fn next_expiration(&mut self, now_us: u64) -> u64 {
+            self.ensure_init(now_us);
+
+            let now_tick = now_us / RES_US;
+
+            // 1. Advance wheel tick-by-tick up to now_tick, firing expired timers.
+            while self.current_tick <= now_tick {
+                let bucket_idx = (self.current_tick as usize) % BUCKETS;
+                let bucket = &mut self.buckets[bucket_idx];
+
+                let mut i = 0;
+                while i < bucket.len() {
+                    if bucket[i].deadline <= now_us {
+                        let timer = bucket.swap_remove(i);
+                        timer.waker.wake_by_ref();
+                    } else {
+                        i += 1;
+                    }
+                }
+
+                self.current_tick += 1;
+            }
+
+            // 2. Find earliest future deadline across all buckets.
+            let mut next_alarm = u64::MAX;
+
+            for bucket in &self.buckets {
+                for timer in bucket.iter() {
+                    next_alarm = min(next_alarm, timer.deadline);
+                }
+            }
+
+            next_alarm
+        }
+    }
+}
+
 /// This module is used to provide a time driver for the `embassy-time` crate.
 ///
 /// The minimum provided resolution is ~ 20-30us when the CPU is at top speed of 240MHz
@@ -390,17 +608,42 @@ pub mod embassy_time_driver {
     use std::sync::OnceLock;
 
     use ::embassy_time_driver::Driver;
-    use embassy_time_queue_utils::Queue;
 
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
     use embassy_sync::blocking_mutex::Mutex as CsMutex;
+
+    use super::timer_wheel::TimerWheel;
 
     use crate::timer::*;
 
     static TIMER_SERVICE: OnceLock<EspTaskTimerService> = OnceLock::new();
 
+    // Example tuning: 32 buckets, 4 timers per bucket, 100 µs resolution
+    pub type InnerWheel = TimerWheel<32, 4, 100>;
+
+    #[derive(Debug)]
+    struct Queue {
+        wheel: InnerWheel,
+    }
+
+    impl Queue {
+        pub fn new() -> Self {
+            Self {
+                wheel: InnerWheel::new(),
+            }
+        }
+
+        pub fn schedule_wake(&mut self, at: u64, waker: &Waker) -> bool {
+            self.wheel.schedule_wake(at, waker)
+        }
+
+        pub fn next_expiration(&mut self, now: u64) -> u64 {
+            self.wheel.next_expiration(now)
+        }
+    }
+
     struct EspDriverInner {
-        queue: embassy_time_queue_utils::Queue,
+        queue: Option<Queue>,
         timer: Option<EspTimer<'static>>,
     }
 
@@ -411,18 +654,30 @@ pub mod embassy_time_driver {
             unsafe { esp_timer_get_time() as _ }
         }
 
+        fn queue_mut(&mut self) -> &mut Queue {
+            if self.queue.is_none() {
+                // lazy runtime init (legal because this isn't const code)
+                self.queue = Some(Queue::new());
+            }
+            self.queue.as_mut().unwrap()
+        }
+
         fn schedule_next_expiration(&mut self) {
             /// End of epoch minus one day
             const MAX_SAFE_TIMEOUT_US: u64 = u64::MAX - 24 * 60 * 60 * 1000 * 1000;
 
-            let timer = self
-                .timer
-                .as_mut()
-                .expect("timer must be created before scheduling");
-
             loop {
                 let now = Self::now();
-                let next_at = self.queue.next_expiration(now);
+
+                let next_at = {
+                    let queue = self.queue_mut();
+                    queue.next_expiration(now)
+                };
+
+                let timer = self
+                    .timer
+                    .as_mut()
+                    .expect("timer must be created before scheduling");
 
                 // `next_at == u64::MAX` means "no timers" in the integrated queue.
                 if next_at == u64::MAX {
@@ -469,7 +724,7 @@ pub mod embassy_time_driver {
         const fn new() -> Self {
             Self {
                 inner: CsMutex::new(EspDriverInner {
-                    queue: Queue::new(),
+                    queue: None,
                     timer: None,
                 }),
             }
@@ -498,24 +753,24 @@ pub mod embassy_time_driver {
             // tasks, ensuring only one mutable borrow exists at a time. Therefore, this
             // call cannot create overlapping &mut borrows and is sound.
             unsafe {
-                self.inner.lock_mut(|inner| {
-                    if inner.timer.is_none() {
-                        // Driver is always statically allocated, so this is safe
+                self.inner.lock_mut(|state| {
+                    if state.timer.is_none() {
+                        // Driver is statically allocated, so this is safe.
                         let static_self: &'static Self = core::mem::transmute(self);
 
-                        inner.timer = Some(
+                        state.timer = Some(
                             service
                                 .timer(move || {
-                                    static_self.inner.lock_mut(|inner| {
-                                        inner.schedule_next_expiration();
+                                    static_self.inner.lock_mut(|s| {
+                                        s.schedule_next_expiration();
                                     });
                                 })
                                 .unwrap(),
                         );
                     }
 
-                    if inner.queue.schedule_wake(at, waker) {
-                        inner.schedule_next_expiration();
+                    if state.queue_mut().schedule_wake(at, waker) {
+                        state.schedule_next_expiration();
                     }
                 })
             };
